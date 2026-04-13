@@ -1,6 +1,6 @@
 from agents.base_agent import BaseAgent
 
 
-class translator_agent(BaseAgent):
+class TranslatorAgent(BaseAgent):
     system_prompt="""
                   """

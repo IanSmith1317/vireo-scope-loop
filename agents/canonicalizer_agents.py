@@ -1,6 +1,6 @@
 from agents.base_agent import BaseAgent
 
 
-class canonicalizer_agent(BaseAgent):
+class CanonicalizerAgent(BaseAgent):
     system_prompt="""
                   """
