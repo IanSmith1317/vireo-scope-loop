@@ -4,7 +4,7 @@ import json
 
 from config import API_KEY, MODEL_LOW, MODEL_HIGH
 from agents.scope_agents import ScopeAgent, ScopeAgentOutput
-from agents.canonicalizer_agents import CanonicalizerAgent
+from agents.canonicalizer_agents import CanonicalizerAgent, CanonicalizerOutput
 from agents.translator_agents import TranslatorAgent
 from agents.auditor_agents import AuditorAgent
 from agents.base_agent import BaseAgent
@@ -16,9 +16,6 @@ def clean_json_response(text: str) -> str:
     if text.endswith("```"):
         text = text.rsplit("```", 1)[0]
     return text.strip()
-
-
-
 
 if __name__=="__main__":
 
@@ -36,6 +33,9 @@ if __name__=="__main__":
         # "Vice President of Corporate Development",
         # "Equity Research Analyst"
     ]
+
+    all_workflows: list[ScopeAgentOutput] = []
+
     print("Spinning Up Agents")
     #Instantiate agents...
     canonicalizer_agent = CanonicalizerAgent(model=MODEL_LOW)
@@ -76,40 +76,47 @@ if __name__=="__main__":
         try:
             print("Pasring JSON...")
             #returns a list of ScopeAgentOutput pydantic models
-            parsed = ScopeAgentOutput.model_validate(json.loads(clean_json_response(scope_agent_resp)))
+            scope_parsed = ScopeAgentOutput.model_validate(json.loads(clean_json_response(scope_agent_resp)))
             print("...OK!")
             print("///////PARSED///////")
-            print(parsed)
+            print(scope_parsed)
             print("/////// END ////////")
+
+            all_workflows.extend(scope_parsed.workflows)
+
         except:
             print(">>>>>>JSON PARSE ERROR!")
             print(scope_agent_resp)
         
-        for workflow in parsed.workflows:
-            print(workflow)
-            continue
 
-            #Canonicalizer Agent de duplicates and clusters the primitives
-            canonical_scope = canonicalizer_agent.ask(scope_agent_resp)
-            
-            #Translator Agent translates the extracts into key inputs, outputs, steps, transformations, and constraints
-            translated_scope = translator_agent.ask(canonical_scope)
+    print("CANONIZING WORKFLOWS.....")
+    #Canonicalizer Agent de duplicates and clusters the primitives
+    canonical_input = [w.model_dump() for w in all_workflows]
+    canonical_user_prompt = canonicalizer_agent.build_user_prompt(canonical_input)
+    canonical_resp = canonicalizer_agent.ask(user_prompt= canonical_user_prompt)
+    canonical_result = CanonicalizerOutput.model_validate(json.loads(clean_json_response(canonical_resp)))
 
-            #Auditor maps each step to capabilty within Vireo. Returns bool pass fail
-            audit_pass = auditor_agent.ask(translated_scope)
+    print(canonical_result)
+    print("....done!")
+     
+            # #Translator Agent translates the extracts into key inputs, outputs, steps, transformations, and constraints
+            # translated_scope = translator_agent.ask(canonical_scope)
 
-            if audit_pass:
-                #TODO: implement frequency counter
-                #TODO: implement PM Agent
-                #TODO: execute build decision logic
-                #TODO: implement spec writer
-                #TODO: implement human reviewer gate
-                #TODO: implement code executor (to operate within the actual Vireo Project)
-                #TODO: implement code reviewer
+            # #Auditor maps each step to capabilty within Vireo. Returns bool pass fail
+            # audit_pass = auditor_agent.ask(translated_scope)
 
-                pass
-            else:
-                pass
+            # if audit_pass:
+            #     #TODO: implement frequency counter
+            #     #TODO: implement PM Agent
+            #     #TODO: execute build decision logic
+            #     #TODO: implement spec writer
+            #     #TODO: implement human reviewer gate
+            #     #TODO: implement code executor (to operate within the actual Vireo Project)
+            #     #TODO: implement code reviewer
+
+            #     pass
+            # else:
+            #     pass
 
     print("...SESSION END!")
 
