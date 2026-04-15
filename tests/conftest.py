@@ -1,6 +1,6 @@
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 
 def make_text_block(text: str):
@@ -171,11 +171,19 @@ def sample_cluster():
 
 @pytest.fixture
 def mock_anthropic():
-    """Patch the Anthropic class in base_agent so .ask() never hits the real API."""
+    """Patch sync and async Anthropic classes so .ask()/.ask_async() never hit the real API."""
     from unittest.mock import patch
 
-    with patch("agents.base_agent.Anthropic") as mock_cls:
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.messages.create.return_value = make_api_response("{}")
-        yield client
+    with (
+        patch("agents.base_agent.Anthropic") as mock_sync_cls,
+        patch("agents.base_agent.AsyncAnthropic") as mock_async_cls,
+    ):
+        sync_client = MagicMock()
+        sync_client.messages.create.return_value = make_api_response("{}")
+        mock_sync_cls.return_value = sync_client
+
+        async_client = MagicMock()
+        async_client.messages.create = AsyncMock(return_value=make_api_response("{}"))
+        mock_async_cls.return_value = async_client
+
+        yield sync_client, async_client

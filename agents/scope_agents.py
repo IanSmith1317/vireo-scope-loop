@@ -5,9 +5,10 @@ from agents.base_agent import BaseAgent
 
 class ScopeAgent(BaseAgent):
     
-    def __init__(self, model:str, role: str):
+    def __init__(self, model: str, role: str):
         super().__init__(model=model)
         self.role = role
+        self.cache_system_prompt = True
         self.system_prompt = """
             You are an expert analyst of how professionals use Microsoft Excel in real day-to-day work.
 

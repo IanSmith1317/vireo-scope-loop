@@ -6,6 +6,7 @@ from agents.base_agent import BaseAgent
 class SpecWriterAgent(BaseAgent):
     def __init__(self, model: str, max_tokens: int | None = None):
         super().__init__(model=model, max_tokens=max_tokens or 8192)
+        self.cache_system_prompt = True
 
         self.system_prompt = """You are a technical specification writer for Vireo, a desktop financial modeling application that uses node-based programming.
 

@@ -17,6 +17,10 @@ class TestScopeAgentInit:
         assert "Microsoft Excel" in agent.system_prompt
         assert len(agent.system_prompt) > 100
 
+    def test_cache_system_prompt_enabled(self):
+        agent = ScopeAgent(model="test", role="FP&A Analyst")
+        assert agent.cache_system_prompt is True
+
 
 class TestBuildUserPrompt:
     def test_includes_role_and_count(self):

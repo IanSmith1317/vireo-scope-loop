@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -88,7 +89,85 @@ def already_deferred(primitive: str, defer_queue: list[dict], log: dict) -> bool
     return False
 
 
-def main():
+async def _generate_for_role(
+    role: str,
+    weight: float,
+    model: str,
+) -> list[ScopeWorkflow]:
+    """Run all scope iterations for a single role. Called concurrently per role."""
+    console.print(f"\n[bold]Role: {role}[/bold] (weight {weight})")
+    scope = ScopeAgent(model=model, role=role)
+    workflows: list[ScopeWorkflow] = []
+    previously_generated: list[str] = []
+
+    for i in range(ITERATIONS_PER_ROLE):
+        console.print(f"  [{role}] Iteration {i + 1}/{ITERATIONS_PER_ROLE}...")
+        user_prompt = scope.build_user_prompt(
+            count=WORKFLOWS_PER_CALL,
+            previously_generated=previously_generated,
+        )
+        try:
+            resp = await scope.ask_async(user_prompt)
+            parsed = ScopeAgentOutput.model_validate(
+                json.loads(clean_json_response(resp))
+            )
+            workflows.extend(parsed.workflows)
+            previously_generated.extend(w.task_title for w in parsed.workflows)
+            console.print(f"    [{role}] [green]{len(parsed.workflows)} workflows generated[/green]")
+        except (json.JSONDecodeError, Exception) as e:
+            console.print(f"    [{role}] [red]Error: {e}[/red]")
+            continue
+
+    return workflows
+
+
+async def _write_spec(
+    decision,
+    spec_writer: SpecWriterAgent,
+    translator_result: TranslatorOutput,
+    manifest: dict,
+    compositions: list,
+    output_dir: Path,
+    frequency_log: dict,
+) -> Path | None:
+    """Write a single spec file. Called concurrently per accepted gap."""
+    console.print(f"\nWriting spec for [bold]{decision.gap_primitive}[/bold]...")
+
+    relevant_results = [
+        r.model_dump() for r in translator_result.results
+        if any(
+            step.primitive == decision.gap_primitive
+            for step in (
+                next(
+                    (tr for tr in translator_result.results
+                     if tr.canonical_label == r.canonical_label),
+                    r,
+                )
+            ).transformation_steps
+        )
+    ]
+
+    spec_prompt = spec_writer.build_user_prompt(
+        gap_primitive=decision.gap_primitive,
+        pm_decision=decision.model_dump(),
+        translator_results=relevant_results,
+        manifest=manifest,
+        compositions=compositions,
+    )
+
+    try:
+        spec_text = await spec_writer.ask_async(spec_prompt)
+        output_path = output_dir / f"{decision.gap_primitive}_spec.md"
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(spec_text)
+        console.print(f"  [green]Spec written: {output_path}[/green]")
+        return output_path
+    except Exception as e:
+        console.print(f"  [red]Spec writing failed for {decision.gap_primitive}: {e}[/red]")
+        return None
+
+
+async def main():
     console.print(Panel("VIREO SCOPE LOOP — SESSION START", style="bold green"))
 
     # ------------------------------------------------------------------
@@ -117,34 +196,16 @@ def main():
     console.print("[green]...OK![/green]")
 
     # ==================================================================
-    # PHASE 1: Scope Generation
+    # PHASE 1: Scope Generation (roles run concurrently)
     # ==================================================================
-    console.print(Panel("PHASE 1: Scope Generation", style="bold cyan"))
+    console.print(Panel("PHASE 1: Scope Generation (async)", style="bold cyan"))
 
-    all_workflows: list[ScopeWorkflow] = []
-
-    for role, weight in ROLES:
-        console.print(f"\n[bold]Role: {role}[/bold] (weight {weight})")
-        scope = ScopeAgent(model=MODEL_LOW, role=role)
-        previously_generated: list[str] = []
-
-        for i in range(ITERATIONS_PER_ROLE):
-            console.print(f"  Iteration {i + 1}/{ITERATIONS_PER_ROLE}...")
-            user_prompt = scope.build_user_prompt(
-                count=WORKFLOWS_PER_CALL,
-                previously_generated=previously_generated,
-            )
-            try:
-                resp = scope.ask(user_prompt)
-                parsed = ScopeAgentOutput.model_validate(
-                    json.loads(clean_json_response(resp))
-                )
-                all_workflows.extend(parsed.workflows)
-                previously_generated.extend(w.task_title for w in parsed.workflows)
-                console.print(f"    [green]{len(parsed.workflows)} workflows generated[/green]")
-            except (json.JSONDecodeError, Exception) as e:
-                console.print(f"    [red]Error: {e}[/red]")
-                continue
+    role_results = await asyncio.gather(
+        *(_generate_for_role(role, weight, MODEL_LOW) for role, weight in ROLES)
+    )
+    all_workflows: list[ScopeWorkflow] = [
+        wf for batch in role_results for wf in batch
+    ]
 
     console.print(f"\n[bold]Total workflows generated: {len(all_workflows)}[/bold]")
 
@@ -161,7 +222,7 @@ def main():
     canonical_prompt = canonicalizer.build_user_prompt(canonical_input)
 
     try:
-        canonical_resp = canonicalizer.ask(canonical_prompt)
+        canonical_resp = await canonicalizer.ask_async(canonical_prompt)
         canonical_result = CanonicalizerOutput.model_validate(
             json.loads(clean_json_response(canonical_resp))
         )
@@ -181,7 +242,7 @@ def main():
     )
 
     try:
-        translator_resp = translator.ask(translator_prompt)
+        translator_resp = await translator.ask_async(translator_prompt)
         translator_result = TranslatorOutput.model_validate(
             json.loads(clean_json_response(translator_resp))
         )
@@ -201,7 +262,7 @@ def main():
     )
 
     try:
-        auditor_resp = auditor.ask(auditor_prompt)
+        auditor_resp = await auditor.ask_async(auditor_prompt)
         auditor_result = AuditorOutput.model_validate(
             json.loads(clean_json_response(auditor_resp))
         )
@@ -222,7 +283,6 @@ def main():
         if cluster_audit.passed:
             continue
 
-        # Find the canonical cluster to get source_indices
         matching_cluster = next(
             (c for c in canonical_result.clusters
              if c.canonical_label == cluster_audit.canonical_label),
@@ -246,7 +306,6 @@ def main():
 
     save_json(FREQUENCY_LOG_PATH, frequency_log)
 
-    # Print frequency summary
     for prim, data in sorted(frequency_log.items(), key=lambda x: x[1]["count"], reverse=True):
         status = "[green]ABOVE THRESHOLD[/green]" if (
             data["count"] >= FREQUENCY_THRESHOLD and len(data["roles"]) >= ROLE_THRESHOLD
@@ -260,7 +319,6 @@ def main():
 
     escalated = gaps_above_threshold(frequency_log)
 
-    # Filter out already-deferred gaps whose frequency hasn't increased
     escalated = [
         g for g in escalated
         if not already_deferred(g["gap_primitive"], defer_queue, frequency_log)
@@ -282,7 +340,7 @@ def main():
     )
 
     try:
-        pm_resp = pm.ask(pm_prompt)
+        pm_resp = await pm.ask_async(pm_prompt)
         pm_result = PMOutput.model_validate(
             json.loads(clean_json_response(pm_resp))
         )
@@ -315,49 +373,27 @@ def main():
         return
 
     # ==================================================================
-    # PHASE 7: Spec Writing
+    # PHASE 7: Spec Writing (specs written concurrently)
     # ==================================================================
-    console.print(Panel("PHASE 7: Spec Writing", style="bold cyan"))
+    console.print(Panel("PHASE 7: Spec Writing (async)", style="bold cyan"))
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    for decision in accepted:
-        console.print(f"\nWriting spec for [bold]{decision.gap_primitive}[/bold]...")
-
-        # Find translator results relevant to this gap
-        relevant_results = [
-            r.model_dump() for r in translator_result.results
-            if any(
-                step.primitive == decision.gap_primitive
-                for step in (
-                    next(
-                        (tr for tr in translator_result.results
-                         if tr.canonical_label == r.canonical_label),
-                        r,
-                    )
-                ).transformation_steps
-            )
-        ]
-
-        spec_prompt = spec_writer.build_user_prompt(
-            gap_primitive=decision.gap_primitive,
-            pm_decision=decision.model_dump(),
-            translator_results=relevant_results,
+    await asyncio.gather(*(
+        _write_spec(
+            decision=decision,
+            spec_writer=spec_writer,
+            translator_result=translator_result,
             manifest=manifest,
             compositions=compositions,
+            output_dir=OUTPUT_DIR,
+            frequency_log=frequency_log,
         )
-
-        try:
-            spec_text = spec_writer.ask(spec_prompt)
-            output_path = OUTPUT_DIR / f"{decision.gap_primitive}_spec.md"
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(spec_text)
-            console.print(f"  [green]Spec written: {output_path}[/green]")
-        except Exception as e:
-            console.print(f"  [red]Spec writing failed for {decision.gap_primitive}: {e}[/red]")
+        for decision in accepted
+    ))
 
     console.print(Panel("SESSION END", style="bold green"))
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

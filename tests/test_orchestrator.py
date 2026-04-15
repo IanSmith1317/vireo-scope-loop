@@ -1,12 +1,13 @@
 import json
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch, call
 from pathlib import Path
 
 import orchestrator
 from orchestrator import (
     load_json, save_json, update_frequency_log,
     gaps_above_threshold, already_deferred, main,
+    _generate_for_role, _write_spec,
 )
 from tests.conftest import (
     SAMPLE_WORKFLOW, SAMPLE_CLUSTER, SAMPLE_TRANSLATOR_RESULT,
@@ -17,7 +18,7 @@ from tests.conftest import (
 
 
 # =========================================================================
-# Helper function tests
+# Helper function tests (synchronous — unchanged)
 # =========================================================================
 
 class TestLoadJson:
@@ -188,7 +189,36 @@ class TestAlreadyDeferred:
 
 
 # =========================================================================
-# main() integration tests
+# async helper tests
+# =========================================================================
+
+class TestGenerateForRole:
+    async def test_returns_workflows(self, monkeypatch):
+        mock_cls = MagicMock()
+        inst = mock_cls.return_value
+        inst.build_user_prompt.return_value = "prompt"
+        inst.ask_async = AsyncMock(return_value=_scope_response())
+        monkeypatch.setattr(orchestrator, "ScopeAgent", mock_cls)
+        monkeypatch.setattr(orchestrator, "ITERATIONS_PER_ROLE", 1)
+        monkeypatch.setattr(orchestrator, "WORKFLOWS_PER_CALL", 2)
+        result = await _generate_for_role("FP&A Analyst", 0.40, "test-model")
+        assert len(result) == 1
+        assert result[0].task_title == SAMPLE_WORKFLOW["task_title"]
+
+    async def test_continues_on_error(self, monkeypatch):
+        mock_cls = MagicMock()
+        inst = mock_cls.return_value
+        inst.build_user_prompt.return_value = "prompt"
+        inst.ask_async = AsyncMock(side_effect=Exception("fail"))
+        monkeypatch.setattr(orchestrator, "ScopeAgent", mock_cls)
+        monkeypatch.setattr(orchestrator, "ITERATIONS_PER_ROLE", 1)
+        monkeypatch.setattr(orchestrator, "WORKFLOWS_PER_CALL", 2)
+        result = await _generate_for_role("FP&A Analyst", 0.40, "test-model")
+        assert result == []
+
+
+# =========================================================================
+# main() integration tests (all async)
 # =========================================================================
 
 @pytest.fixture
@@ -261,287 +291,267 @@ def _pm_response_mixed():
 
 
 def _mock_all_agents(monkeypatch):
-    """Patch all agent classes and return mock instances."""
+    """Patch all agent classes. Instances get an AsyncMock ask_async."""
     mocks = {}
     for name in ["ScopeAgent", "CanonicalizerAgent", "TranslatorAgent",
                   "AuditorAgent", "PMAgent", "SpecWriterAgent"]:
         cls_mock = MagicMock()
+        inst = cls_mock.return_value
+        inst.ask_async = AsyncMock()
         monkeypatch.setattr(orchestrator, name, cls_mock)
         mocks[name] = cls_mock
     return mocks
 
 
+def _setup_through_audit(mocks, audit_response):
+    """Configure mock agents through the audit phase (all async)."""
+    scope_inst = mocks["ScopeAgent"].return_value
+    scope_inst.build_user_prompt.return_value = "prompt"
+    scope_inst.ask_async = AsyncMock(return_value=_scope_response())
+
+    canon_inst = mocks["CanonicalizerAgent"].return_value
+    canon_inst.build_user_prompt.return_value = "prompt"
+    canon_inst.ask_async = AsyncMock(return_value=_canonical_response())
+
+    trans_inst = mocks["TranslatorAgent"].return_value
+    trans_inst.build_user_prompt.return_value = "prompt"
+    trans_inst.ask_async = AsyncMock(return_value=_translator_response())
+
+    audit_inst = mocks["AuditorAgent"].return_value
+    audit_inst.build_user_prompt.return_value = "prompt"
+    audit_inst.ask_async = AsyncMock(return_value=audit_response)
+
+
 class TestMainNoManifest:
-    def test_exits_early_when_manifest_missing(self, pipeline_env):
+    async def test_exits_early_when_manifest_missing(self, pipeline_env):
         pipeline_env["manifest_path"].unlink()
-        agents = _mock_all_agents(pytest.MonkeyPatch())
-        # Even without mocking agents, main should exit before touching them
-        # But we need to monkeypatch the agent classes because they're imported.
-        # Actually, main will fail at load_json returning {} which is falsy.
-        main()
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
-    def test_exits_early_when_manifest_empty(self, pipeline_env):
+    async def test_exits_early_when_manifest_empty(self, pipeline_env):
         pipeline_env["manifest_path"].write_text("{}")
-        main()
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
 
 class TestMainScopeFailures:
-    def test_no_workflows_generated(self, pipeline_env, monkeypatch):
+    async def test_no_workflows_generated(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         scope_inst = mocks["ScopeAgent"].return_value
         scope_inst.build_user_prompt.return_value = "prompt"
-        scope_inst.ask.side_effect = Exception("API error")
-        main()
+        scope_inst.ask_async = AsyncMock(side_effect=Exception("API error"))
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
-    def test_scope_json_parse_error_continues(self, pipeline_env, monkeypatch):
+    async def test_scope_json_parse_error_continues(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         scope_inst = mocks["ScopeAgent"].return_value
         scope_inst.build_user_prompt.return_value = "prompt"
-        # First call fails, but since ITERATIONS_PER_ROLE=1 and only 1 role,
-        # no workflows are generated and main exits
-        scope_inst.ask.return_value = "not valid json"
-        main()
+        scope_inst.ask_async = AsyncMock(return_value="not valid json")
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
 
 class TestMainCanonicalizationFailure:
-    def test_exits_on_canonicalization_error(self, pipeline_env, monkeypatch):
+    async def test_exits_on_canonicalization_error(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
-        # Scope succeeds
         scope_inst = mocks["ScopeAgent"].return_value
         scope_inst.build_user_prompt.return_value = "prompt"
-        scope_inst.ask.return_value = _scope_response()
-        # Canonicalizer fails
+        scope_inst.ask_async = AsyncMock(return_value=_scope_response())
         canon_inst = mocks["CanonicalizerAgent"].return_value
         canon_inst.build_user_prompt.return_value = "prompt"
-        canon_inst.ask.side_effect = Exception("API error")
-        main()
+        canon_inst.ask_async = AsyncMock(side_effect=Exception("API error"))
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
 
 class TestMainTranslationFailure:
-    def test_exits_on_translation_error(self, pipeline_env, monkeypatch):
+    async def test_exits_on_translation_error(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         scope_inst = mocks["ScopeAgent"].return_value
         scope_inst.build_user_prompt.return_value = "prompt"
-        scope_inst.ask.return_value = _scope_response()
+        scope_inst.ask_async = AsyncMock(return_value=_scope_response())
         canon_inst = mocks["CanonicalizerAgent"].return_value
         canon_inst.build_user_prompt.return_value = "prompt"
-        canon_inst.ask.return_value = _canonical_response()
-        # Translator fails
+        canon_inst.ask_async = AsyncMock(return_value=_canonical_response())
         trans_inst = mocks["TranslatorAgent"].return_value
         trans_inst.build_user_prompt.return_value = "prompt"
-        trans_inst.ask.side_effect = Exception("API error")
-        main()
+        trans_inst.ask_async = AsyncMock(side_effect=Exception("API error"))
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
 
 class TestMainAuditFailure:
-    def test_exits_on_audit_error(self, pipeline_env, monkeypatch):
+    async def test_exits_on_audit_error(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         scope_inst = mocks["ScopeAgent"].return_value
         scope_inst.build_user_prompt.return_value = "prompt"
-        scope_inst.ask.return_value = _scope_response()
+        scope_inst.ask_async = AsyncMock(return_value=_scope_response())
         canon_inst = mocks["CanonicalizerAgent"].return_value
         canon_inst.build_user_prompt.return_value = "prompt"
-        canon_inst.ask.return_value = _canonical_response()
+        canon_inst.ask_async = AsyncMock(return_value=_canonical_response())
         trans_inst = mocks["TranslatorAgent"].return_value
         trans_inst.build_user_prompt.return_value = "prompt"
-        trans_inst.ask.return_value = _translator_response()
-        # Auditor fails
+        trans_inst.ask_async = AsyncMock(return_value=_translator_response())
         audit_inst = mocks["AuditorAgent"].return_value
         audit_inst.build_user_prompt.return_value = "prompt"
-        audit_inst.ask.return_value = "not json"
-        main()
+        audit_inst.ask_async = AsyncMock(return_value="not json")
+        await main()
         assert not pipeline_env["output_dir"].exists()
 
 
-def _setup_through_audit(mocks, audit_response):
-    """Configure mock agents through the audit phase."""
-    scope_inst = mocks["ScopeAgent"].return_value
-    scope_inst.build_user_prompt.return_value = "prompt"
-    scope_inst.ask.return_value = _scope_response()
-
-    canon_inst = mocks["CanonicalizerAgent"].return_value
-    canon_inst.build_user_prompt.return_value = "prompt"
-    canon_inst.ask.return_value = _canonical_response()
-
-    trans_inst = mocks["TranslatorAgent"].return_value
-    trans_inst.build_user_prompt.return_value = "prompt"
-    trans_inst.ask.return_value = _translator_response()
-
-    audit_inst = mocks["AuditorAgent"].return_value
-    audit_inst.build_user_prompt.return_value = "prompt"
-    audit_inst.ask.return_value = audit_response
-
-
 class TestMainAllPassAudit:
-    def test_no_gaps_exits_after_frequency(self, pipeline_env, monkeypatch):
+    async def test_no_gaps_exits_after_frequency(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_pass())
-        main()
-        # No spec files written
+        await main()
         assert not pipeline_env["output_dir"].exists() or len(list(pipeline_env["output_dir"].iterdir())) == 0
-        # PM was never called
-        mocks["PMAgent"].return_value.ask.assert_not_called()
+        mocks["PMAgent"].return_value.ask_async.assert_not_awaited()
 
 
 class TestMainFrequencyTracking:
-    def test_no_matching_cluster_skipped(self, pipeline_env, monkeypatch):
+    async def test_no_matching_cluster_skipped(self, pipeline_env, monkeypatch):
         """Audit result references a label not in canonical clusters."""
         mocks = _mock_all_agents(monkeypatch)
-        # Audit result with a different label than what canonicalizer returned
         mismatched_audit = {
             **SAMPLE_AUDIT_FAIL,
             "canonical_label": "nonexistent-label",
         }
         _setup_through_audit(mocks, json.dumps({"results": [mismatched_audit]}))
-        main()
-        # Frequency log should be empty (gap wasn't tracked)
+        await main()
         if pipeline_env["freq_log_path"].exists():
             log = json.loads(pipeline_env["freq_log_path"].read_text())
             assert log == {}
 
 
 class TestMainBelowThreshold:
-    def test_gaps_below_threshold_not_escalated(self, pipeline_env, monkeypatch):
+    async def test_gaps_below_threshold_not_escalated(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
-        # Set high thresholds so gaps don't escalate
         monkeypatch.setattr(orchestrator, "FREQUENCY_THRESHOLD", 100)
         monkeypatch.setattr(orchestrator, "ROLE_THRESHOLD", 50)
-        main()
-        mocks["PMAgent"].return_value.ask.assert_not_called()
+        await main()
+        mocks["PMAgent"].return_value.ask_async.assert_not_awaited()
 
 
 class TestMainAlreadyDeferredFiltered:
-    def test_deferred_gap_not_re_evaluated(self, pipeline_env, monkeypatch):
+    async def test_deferred_gap_not_re_evaluated(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
-        # Pre-populate defer queue with the gap at current frequency
         defer_data = {
             "deferred": [{
                 "primitive": "import",
                 "reason": "previously deferred",
                 "deferred_at": "2026-01-01",
-                "frequency_at_deferral": 999,  # high enough to suppress
+                "frequency_at_deferral": 999,
             }]
         }
         pipeline_env["defer_path"].parent.mkdir(parents=True, exist_ok=True)
         pipeline_env["defer_path"].write_text(json.dumps(defer_data))
-        main()
-        mocks["PMAgent"].return_value.ask.assert_not_called()
+        await main()
+        mocks["PMAgent"].return_value.ask_async.assert_not_awaited()
 
 
 class TestMainPMFailure:
-    def test_exits_on_pm_error(self, pipeline_env, monkeypatch):
+    async def test_exits_on_pm_error(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = "not json"
-        main()
+        pm_inst.ask_async = AsyncMock(return_value="not json")
+        await main()
         assert not pipeline_env["output_dir"].exists() or len(list(pipeline_env["output_dir"].iterdir())) == 0
 
 
 class TestMainPMDecisions:
-    def test_all_rejected(self, pipeline_env, monkeypatch):
+    async def test_all_rejected(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_reject()
-        main()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_reject())
+        await main()
         assert not pipeline_env["output_dir"].exists() or len(list(pipeline_env["output_dir"].iterdir())) == 0
 
-    def test_all_deferred(self, pipeline_env, monkeypatch):
+    async def test_all_deferred(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_defer()
-        main()
-        # Defer queue should be updated
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_defer())
+        await main()
         defer_data = json.loads(pipeline_env["defer_path"].read_text())
         assert len(defer_data["deferred"]) == 1
         assert defer_data["deferred"][0]["primitive"] == "chart"
 
-    def test_mixed_decisions(self, pipeline_env, monkeypatch):
+    async def test_mixed_decisions(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_mixed()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_mixed())
         spec_inst = mocks["SpecWriterAgent"].return_value
         spec_inst.build_user_prompt.return_value = "prompt"
-        spec_inst.ask.return_value = "# Import Spec\n\nMarkdown content"
-        main()
-        # Accepted gap should have a spec file
+        spec_inst.ask_async = AsyncMock(return_value="# Import Spec\n\nMarkdown content")
+        await main()
         spec_file = pipeline_env["output_dir"] / "import_spec.md"
         assert spec_file.exists()
         assert "Import Spec" in spec_file.read_text()
-        # Deferred gap in queue
         defer_data = json.loads(pipeline_env["defer_path"].read_text())
         deferred_prims = [d["primitive"] for d in defer_data["deferred"]]
         assert "chart" in deferred_prims
 
 
 class TestMainHappyPath:
-    def test_full_pipeline_writes_spec(self, pipeline_env, monkeypatch):
+    async def test_full_pipeline_writes_spec(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_accept()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_accept())
         spec_inst = mocks["SpecWriterAgent"].return_value
         spec_inst.build_user_prompt.return_value = "prompt"
-        spec_inst.ask.return_value = "# Import\n\nThis is the spec."
-        main()
+        spec_inst.ask_async = AsyncMock(return_value="# Import\n\nThis is the spec.")
+        await main()
         spec_file = pipeline_env["output_dir"] / "import_spec.md"
         assert spec_file.exists()
         content = spec_file.read_text()
         assert "Import" in content
         assert "This is the spec." in content
 
-    def test_frequency_log_persisted(self, pipeline_env, monkeypatch):
+    async def test_frequency_log_persisted(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_accept()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_accept())
         spec_inst = mocks["SpecWriterAgent"].return_value
         spec_inst.build_user_prompt.return_value = "prompt"
-        spec_inst.ask.return_value = "# Spec"
-        main()
+        spec_inst.ask_async = AsyncMock(return_value="# Spec")
+        await main()
         log = json.loads(pipeline_env["freq_log_path"].read_text())
         assert "import" in log
         assert log["import"]["count"] >= 1
 
 
 class TestMainSpecWriterFailure:
-    def test_continues_after_spec_error(self, pipeline_env, monkeypatch):
+    async def test_continues_after_spec_error(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_accept()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_accept())
         spec_inst = mocks["SpecWriterAgent"].return_value
         spec_inst.build_user_prompt.return_value = "prompt"
-        spec_inst.ask.side_effect = Exception("Spec generation failed")
-        # Should not raise — error is caught
-        main()
-        # No spec file written
+        spec_inst.ask_async = AsyncMock(side_effect=Exception("Spec generation failed"))
+        await main()
         output_files = list(pipeline_env["output_dir"].iterdir()) if pipeline_env["output_dir"].exists() else []
         assert len(output_files) == 0
 
 
 class TestMainPreExistingState:
-    def test_loads_existing_frequency_log(self, pipeline_env, monkeypatch):
+    async def test_loads_existing_frequency_log(self, pipeline_env, monkeypatch):
         mocks = _mock_all_agents(monkeypatch)
-        # Pre-populate frequency log
         existing_log = {
             "import": {
                 "count": 2,
@@ -556,14 +566,12 @@ class TestMainPreExistingState:
         _setup_through_audit(mocks, _audit_response_fail())
         pm_inst = mocks["PMAgent"].return_value
         pm_inst.build_user_prompt.return_value = "prompt"
-        pm_inst.ask.return_value = _pm_response_accept()
+        pm_inst.ask_async = AsyncMock(return_value=_pm_response_accept())
         spec_inst = mocks["SpecWriterAgent"].return_value
         spec_inst.build_user_prompt.return_value = "prompt"
-        spec_inst.ask.return_value = "# Spec"
-        main()
+        spec_inst.ask_async = AsyncMock(return_value="# Spec")
+        await main()
         log = json.loads(pipeline_env["freq_log_path"].read_text())
-        # Count should have increased from pre-existing 2
         assert log["import"]["count"] == 3
-        # Both roles should be present
         assert "Treasury Analyst" in log["import"]["roles"]
         assert "FP&A Analyst" in log["import"]["roles"]

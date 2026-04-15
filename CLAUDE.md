@@ -37,11 +37,22 @@ vireo-scope-loop/
 ## Agent architecture
 
 All agents inherit from `BaseAgent` in `agents/base_agent.py`. BaseAgent handles:
-- Anthropic API client instantiation
-- Payload construction (model, max_tokens, system prompt, messages, tools)
-- Response text extraction via the `ask(user_prompt)` method
+- Anthropic API client instantiation (sync via `Anthropic`, async via `AsyncAnthropic`)
+- Client reuse — lazy-initialized per agent instance, not per call
+- Payload construction (model, max_tokens, system prompt with optional prompt caching, messages, tools)
+- Response text extraction via `ask(user_prompt)` (sync) and `ask_async(user_prompt)` (async)
 
 Each agent subclass sets its own `self.system_prompt` in `__init__` and exposes a `build_user_prompt(...)` method that the orchestrator calls to construct the user message.
+
+### Async and prompt caching
+
+The orchestrator uses `async/await` throughout. Phases that make multiple independent API calls run concurrently via `asyncio.gather`:
+- **Phase 1 (Scope Generation):** All 7 roles run concurrently. Iterations within a role remain sequential (each depends on `previously_generated`).
+- **Phase 7 (Spec Writing):** All accepted gap specs are written concurrently.
+
+Prompt caching is enabled on agents that make multiple calls per session. Set `self.cache_system_prompt = True` in the agent's `__init__` to send the system prompt as a cached content block (`cache_control: {"type": "ephemeral"}`). Currently enabled on:
+- `ScopeAgent` — 35 calls per session, identical system prompt
+- `SpecWriterAgent` — N calls per session, identical system prompt
 
 ### Agent flow
 

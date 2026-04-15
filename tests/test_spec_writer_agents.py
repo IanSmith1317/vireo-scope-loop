@@ -13,6 +13,10 @@ class TestSpecWriterAgentInit:
         agent = SpecWriterAgent(model="test", max_tokens=16384)
         assert agent.max_tokens == 16384
 
+    def test_cache_system_prompt_enabled(self):
+        agent = SpecWriterAgent(model="test")
+        assert agent.cache_system_prompt is True
+
     def test_system_prompt_content(self):
         agent = SpecWriterAgent(model="test")
         assert "technical specification writer" in agent.system_prompt

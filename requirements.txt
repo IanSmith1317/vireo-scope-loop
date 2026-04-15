@@ -3,3 +3,6 @@ pydantic
 python-dotenv
 rich
 keyring
+pytest
+pytest-asyncio
+pytest-cov
