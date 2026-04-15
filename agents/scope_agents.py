@@ -53,6 +53,31 @@ class ScopeAgent(BaseAgent):
             - Avoid buzzwords, fluff, and vague abstractions.
             """
 
+    def build_user_prompt(self, count: int, previously_generated: list[str] | None = None) -> str:
+        prompt = f"""Generate {count} realistic Microsoft Excel workflows for the following job function:
+
+Role: {self.role}
+
+Instructions:
+- Focus on recurring and common spreadsheet work this role would realistically perform in Excel.
+- Include a mix of reporting, analysis, modeling, reconciliation, tracker maintenance, and review-preparation workflows where appropriate for the role.
+- Use Microsoft Excel language naturally.
+- Make the workflows specific enough that someone in the profession would recognize them as realistic.
+- Keep the focus on workbook actions, spreadsheet structure, and business purpose.
+- Do not write generic job duties.
+- Do not describe work outside Excel except where another system provides an input file or export.
+
+Return the response exactly in the format described in the system instructions. Do NOT generate more or fewer workflows than requested in this prompt."""
+
+        if previously_generated:
+            titles = "\n".join(f"- {t}" for t in previously_generated)
+            prompt += f"""
+
+Do NOT generate workflows with the following titles or that closely duplicate them:
+{titles}"""
+
+        return prompt
+
 class ScopeWorkflow(BaseModel):
     role: str
     task_title: str

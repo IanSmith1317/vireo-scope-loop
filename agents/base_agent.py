@@ -6,10 +6,12 @@ class BaseAgent:
     max_tokens = MAX_TOKENS
     api_key = API_KEY
     system_prompt = None
-    tools= None
+    tools = None
 
-    def __init__(self, model):
+    def __init__(self, model: str, max_tokens: int | None = None):
         self.model = model
+        if max_tokens is not None:
+            self.max_tokens = max_tokens
 
     def build_payload(self, user_prompt:str):
         payload = {
@@ -42,25 +44,4 @@ class BaseAgent:
             if getattr(block, "type", None) == "text"
         ]
         return "".join(text_parts)
-
-
-#DELETE THIS BLOCK ONCE COMFORTABLE NEW CLASSES WORK!
-# def run_agent(systempt_prompt: str, user_input: str, model:str = MODEL_LOW, max_tokens: int = 4096)->str:
-#     client = Anthropic(
-#         api_key=API_KEY
-#     )
-
-#     message = client.messages.create(
-#         max_tokens=max_tokens,
-#         system = systempt_prompt,
-#         messages=[
-#             {
-#             "role":"user",
-#             "content": user_input,
-#             }
-#         ],
-#         model=model
-#     )
-
-#     return message.content[0].text
 
